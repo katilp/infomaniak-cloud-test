@@ -1,4 +1,4 @@
-# Test workflowfor Infomaniak Kubernetes resources
+# Test workflows for Infomaniak Kubernetes resources
 
 This repository contains Argo workflows tested using Infomaniak Kubernetes resources.
 
@@ -28,6 +28,12 @@ Check the connection with
 kubectl cluster-info
 ```
 
+## Get the code
+
+```
+git@github.com:katilp/infomaniak-cloud-test.git  # or https://github.com/katilp/infomaniak-cloud-test.git if no SSH ke keyy
+cd infomaniak-cloud-test
+```
 
 ## Argo workflows
 
@@ -63,7 +69,7 @@ The Argo CLI to submit jobs from the terminal can be installed with
 curl -sLO "https://github.com/argoproj/argo-workflows/releases/download/v4.0.1/argo-linux-amd64.gz"
 gunzip "argo-linux-amd64.gz"
 chmod +x "argo-linux-amd64"
-sudo mv "./argo-linux-amd64" /usr/local/bin/argo
+sudo mv "./argo-linux-amd64" /usr/local/bin/argo # or without sudo to a path (in your PATH) where can write 
 ```
 
 ## Storage
@@ -86,6 +92,9 @@ Source it in your terminal with
 source <YOUR-PROJECT-NAME>-openrc.txt
 ```
 
+If your environment already has OpenStack environment variables (starting with `OS_`), you might need to unset some
+(e.g. `unset OS_AUTH_TYPE` on lxplus at CERN).
+
 Create an object storage with
 
 ```
@@ -107,8 +116,8 @@ In your terminal, create the cluster secrets to access the storage with
 
 ```
 kubectl create secret generic s3-credentials \
-  --from-literal=AWS_ACCESS_KEY_ID='<the value of the access field>' \
-  --from-literal=AWS_SECRET_ACCESS_KEY='<the value of the secret field>' \
+  --from-literal=S3_ACCESS_KEY_ID='<the value of the access field>' \
+  --from-literal=S3_SECRET_ACCESS_KEY='<the value of the secret field>' \
   -n argo
 ```
 
