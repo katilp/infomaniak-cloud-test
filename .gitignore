@@ -1,2 +1,3 @@
-PCU-AGHLSED-openrc.txt
+.gitignore
+*-openrc.txt
 config
