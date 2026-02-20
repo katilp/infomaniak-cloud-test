@@ -24,7 +24,7 @@ spec:
         s3:
           endpoint: s3.pub1.infomaniak.cloud # from https://docs.infomaniak.cloud/object_storage/s3/
           bucket: mystorage  # created with: openstack container create mystorage
-          region: us-east-1  # placeholder, Informaniak storage is in Switzerland
+          region: us-east-1  # placeholder, Infomaniak storage is in Switzerland
           accessKeySecret:   # created with: openstack ec2 credentials create (take access, secret)
             name: s3-credentials
             key: S3_ACCESS_KEY_ID
