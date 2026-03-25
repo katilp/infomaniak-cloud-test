@@ -1,4 +1,7 @@
 *-openrc.txt
+bu-*
 config
+venv/
 mytools/
 pfnano/
+logs/

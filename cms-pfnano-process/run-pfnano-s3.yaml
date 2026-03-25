@@ -11,19 +11,29 @@ spec:
     - name: nEvents   
       #FIXME 
       # Number of events in the dataset to be processed (-1 is all)                     
-      value: 100
+      value: -1
     - name: recid
       #FIXME
       # Record id of the dataset to be processed
       value: 30511
     - name: nJobs
       #FIXME 
-      # Number of jobs the processing workflow should be split into
-      value: 1
+      # Number of jobs the processing workflow should be split into 
+      # Matches number of files(and defines the cluster size, 4 x nodes if 4 vCPU)
+      value: 353
     - name: bucket
       #FIXME 
       # Name of cloud storage bucket for storing outputs
       value: mystorage
+    - name: nNodes
+      #FIXME 
+      # Number of nodes for prepull 
+      # - need to give hardcoded CPU request in resource request
+      # - passing it as parameter does not work:
+      #   level=ERROR msg="Failed to parse workflow" 
+      #   error="quantities must match the regular expression '^([+-]?[0-9.]+)([eEinumkKMGTP]*[-+]?[0-9]*)$'"
+      value: 45
+    
 
   templates:
   - name: cms-od-example
@@ -33,6 +43,7 @@ spec:
       - name: recid
       - name: nJobs
       - name: bucket
+      - name: nNodes
     dag:
       tasks:
 
@@ -59,8 +70,15 @@ spec:
           - name: totFiles
             value: "{{tasks.get-metadata.outputs.result}}"
 
-      - name: runpfnano
+      - name: prepull-pfnano-image
         dependencies: [joblist]
+        template: prepull-pfnano-image
+        withSequence:
+          count: "{{inputs.parameters.nNodes}}"
+          start: 1
+
+      - name: runpfnano
+        dependencies: [prepull-pfnano-image]
         template: runpfnano-template
         arguments:
          parameters:
@@ -166,6 +184,17 @@ spec:
           dictlist.append(adict)
         json.dump(dictlist, sys.stdout)
 
+  - name: prepull-pfnano-image
+    script:
+      image: ghcr.io/cms-dpoa/pfnano-image-build:main
+      command: [bash]
+      source: |
+        echo "Image ghcr.io/cms-dpoa/pfnano-image-build:main is now pulled and cached on this node."
+        exit 0
+      resources:
+        requests:
+          cpu:  "3"
+
   # Run the CMSSW step
   # This iterates over the list that it gets as "withParam"
   - name: runpfnano-template
@@ -256,6 +285,7 @@ spec:
 
         sed -i '/process.options.num/s/^/#/g' pfnano_data_2016UL_OpenData_cloud.py
         sed -i "/process.load('FWCore.MessageService.MessageLogger_cfi')/a process.MessageLogger.cerr.FwkReport.reportEvery = 500" pfnano_data_2016UL_OpenData_cloud.py
+        sed -i "/from Configuration.AlCa.GlobalTag import GlobalTag/a process.loadRecoTauTagMVAsFromPrepDB.connect = cms.string('sqlite_file:tau_tags.db')" pfnano_data_2016UL_OpenData_cloud.py
         sed -i "/from Configuration.AlCa.GlobalTag import GlobalTag/a process.GlobalTag.connect = cms.string('sqlite_file:/cvmfs/cms-opendata-conddb.cern.ch/106X_dataRun2_v37.db')" pfnano_data_2016UL_OpenData_cloud.py
         #sed -i "/Customisation from command line/a process.add_(cms.Service("SiteLocalConfigService", overrideSourceTimeout = cms.untracked.uint32(6*60)))" pfnano_data_2016UL_OpenData_cloud.py
 
@@ -270,8 +300,7 @@ spec:
         mv nano_data2016.root /code/scatter/pfnanooutput$it.root
       resources:
         requests:
-          cpu: "480m"
-          memory: "1.1Gi"
+          cpu: "800m"
+          memory: "1.8Gi"
           ephemeral-storage: "2Gi"
-
 
