@@ -1,0 +1,604 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: pfnano-skim-analyse-py-
+spec:
+  entrypoint: main-dag
+  serviceAccountName: argo-service-account
+  
+  arguments:
+    parameters:
+    - name: recid
+      value: "30511"
+    - name: bucket
+      value: "mystorage"
+    - name: nJobs
+      value: "4"
+    - name: reuse-skims
+      value: "false"
+    - name: file-limit
+      value: "0"
+
+  templates:
+  # --- DAG Orchestration ---
+  - name: main-dag
+    inputs:
+      parameters:
+      - name: recid
+      - name: bucket
+      - name: nJobs
+      - name: reuse-skims
+      - name: file-limit
+    dag:
+      tasks:
+      - name: list-files
+        template: list-files
+        arguments:
+          parameters:
+          - name: recid
+            value: "{{inputs.parameters.recid}}"
+          - name: bucket
+            value: "{{inputs.parameters.bucket}}"
+          - name: nJobs
+            value: "{{inputs.parameters.nJobs}}"
+          - name: file-limit
+            value: "{{inputs.parameters.file-limit}}"
+        when: "{{inputs.parameters.reuse-skims}} == false"
+
+      - name: skim-jobs
+        template: skim-job
+        arguments:
+          parameters:
+          - name: job-id
+            value: "{{item}}"
+          - name: bucket
+            value: "{{inputs.parameters.bucket}}"
+          - name: recid
+            value: "{{inputs.parameters.recid}}"
+          artifacts:
+          - name: file-list-input
+            from: "{{tasks.list-files.outputs.artifacts.file-list-artifact}}"
+        dependencies: [list-files]
+        withParam: "{{tasks.list-files.outputs.result}}"
+        when: "{{inputs.parameters.reuse-skims}} == false"
+
+      - name: merge-step
+        template: merge-skims
+        arguments:
+          parameters:
+          - name: recid
+            value: "{{inputs.parameters.recid}}"
+          - name: bucket
+            value: "{{inputs.parameters.bucket}}"
+        dependencies: [skim-jobs]
+        when: "{{inputs.parameters.reuse-skims}} == false"
+
+      - name: analyse-step
+        template: cms-od-analyse
+        arguments:
+          parameters:
+          - name: recid
+            value: "{{inputs.parameters.recid}}"
+          - name: bucket
+            value: "{{inputs.parameters.bucket}}"
+        dependencies: [skim-jobs, merge-step]
+
+  # --- Step 1: List Files ---
+  - name: list-files
+    inputs:
+      parameters:
+      - name: recid
+      - name: bucket
+      - name: nJobs
+      - name: file-limit
+    outputs:
+      result: "job-ids"
+      artifacts:
+      - name: file-list-artifact
+        path: /tmp/file-list.json
+        archive:
+          none: {}
+        s3:
+          endpoint: s3.pub1.infomaniak.cloud
+          bucket: "{{inputs.parameters.bucket}}"
+          region: us-east-1
+          accessKeySecret: { name: s3-credentials, key: S3_ACCESS_KEY_ID }
+          secretKeySecret: { name: s3-credentials, key: S3_SECRET_ACCESS_KEY }
+          insecure: false
+          key: pfnano/{{inputs.parameters.recid}}/file-list.json
+    script:
+      image: python:3.11-slim
+      command: [bash]
+      env:
+      - name: S3_ACCESS_KEY_ID
+        valueFrom:
+          secretKeyRef:
+            name: s3-credentials
+            key: S3_ACCESS_KEY_ID
+      - name: S3_SECRET_ACCESS_KEY
+        valueFrom:
+          secretKeyRef:
+            name: s3-credentials
+            key: S3_SECRET_ACCESS_KEY
+      source: |
+        set -e
+        
+        # Install minio-py to read the storage file list
+        pip install --no-cache-dir minio -q
+
+        python3 - << EOPY
+        from minio import Minio
+        from minio.error import S3Error
+        import json
+        import os
+        import sys
+
+        # Configuration
+        ACCESS_KEY = os.environ['S3_ACCESS_KEY_ID']
+        SECRET_KEY = os.environ['S3_SECRET_ACCESS_KEY']
+        ENDPOINT = 's3.pub1.infomaniak.cloud' # No https:// prefix for Minio client
+        BUCKET = '{{inputs.parameters.bucket}}'
+        PREFIX = 'pfnano/{{inputs.parameters.recid}}/scatter/'
+        NJOBS = {{inputs.parameters.nJobs}}
+        LIMIT = {{inputs.parameters.file-limit}}
+
+        client = Minio(
+            ENDPOINT,
+            access_key=ACCESS_KEY,
+            secret_key=SECRET_KEY,
+            secure=True
+        )
+
+        # List files
+        files = []
+        try:
+            objects = client.list_objects(BUCKET, prefix=PREFIX, recursive=True)
+            for obj in objects:
+                if obj.object_name.endswith('.root'):
+                    files.append(obj.object_name)
+        except S3Error as e:
+            print(f"Error listing files: {e}", file=sys.stderr)
+            sys.exit(1)
+
+        # Apply limit for testing if set
+        if LIMIT > 0:
+            files = files[:LIMIT]
+
+        # Distribute to jobs
+        chunks = [[] for _ in range(NJOBS)]
+        for i, f in enumerate(files):
+            chunks[i % NJOBS].append(f)
+
+        # Build output
+        data = {str(i+1): c for i, c in enumerate(chunks) if c}
+        
+        os.makedirs('/tmp', exist_ok=True)
+        with open('/tmp/file-list.json', 'w') as f:
+            json.dump(data, f)
+            
+        # Print job IDs for Argo
+        print(json.dumps(list(data.keys())))
+        EOPY
+
+  # --- Step 2: Skim job ---
+  - name: skim-job
+    inputs:
+      parameters:
+      - name: job-id
+      - name: bucket
+      - name: recid
+      artifacts:
+      - name: file-list-input
+        path: /tmp/file-list.json
+    outputs:
+      artifacts:
+      - name: skim-outputs
+        path: /tmp/outputs/
+        archive:
+          none: {}
+        s3:
+          endpoint: s3.pub1.infomaniak.cloud
+          bucket: "{{inputs.parameters.bucket}}"
+          region: us-east-1
+          accessKeySecret: { name: s3-credentials, key: S3_ACCESS_KEY_ID }
+          secretKeySecret: { name: s3-credentials, key: S3_SECRET_ACCESS_KEY }
+          insecure: false
+          key: pfnano/{{inputs.parameters.recid}}/skims/job-{{inputs.parameters.job-id}}/
+    script:
+      image: python:3.11-slim
+      command: [bash]
+      resources:
+        requests:
+          cpu: "800m"
+          memory: "1Gi" 
+      env:
+      - name: S3_ACCESS_KEY_ID
+        valueFrom:
+          secretKeyRef:
+            name: s3-credentials
+            key: S3_ACCESS_KEY_ID
+      - name: S3_SECRET_ACCESS_KEY
+        valueFrom:
+          secretKeyRef:
+            name: s3-credentials
+            key: S3_SECRET_ACCESS_KEY
+      source: |
+        set -e
+        
+        JOB_ID="{{inputs.parameters.job-id}}"
+        RECID="{{inputs.parameters.recid}}"
+        BUCKET="{{inputs.parameters.bucket}}"
+        OUTPUT_DIR="/tmp/outputs"
+        
+        mkdir -p "$OUTPUT_DIR"
+
+        apt-get update -qq > /dev/null
+        apt-get install -y -qq jq > /dev/null
+        pip install --no-cache-dir minio uproot awkward -q
+
+        if [ ! -f /tmp/file-list.json ]; then
+          echo "Error: file-list.json not found."
+          exit 1
+        fi
+
+        FILES=$(jq -r ".[\"$JOB_ID\"][]" /tmp/file-list.json)
+        FILE_COUNT=$(echo "$FILES" | grep -c . || true)
+        
+        if [ -z "$FILES" ]; then
+          echo "No files found for Job $JOB_ID"
+          exit 0
+        fi
+
+        cat > /tmp/skim_logic.py << 'EOPY'
+        import uproot
+        import awkward as ak
+        import os
+        import sys
+
+        input_file = os.environ.get('LOCAL_INPUT')
+        output_file = os.environ.get('LOCAL_OUTPUT')
+
+        if not input_file or not output_file:
+            print("Error: Missing input or output path")
+            sys.exit(1)
+
+        # Open input and output
+        with uproot.open(input_file) as f_in, uproot.recreate(output_file) as f_out:
+            tree_in = f_in["Events"]
+            total_entries = tree_in.num_entries
+            
+            # Define batch size (e.g., 50,000 events). 
+            # This keeps memory usage low and constant.
+            batch_size = 30000 
+            
+            # Prepare output arrays (lists to concatenate later)
+            out_nLeptons_list = []
+            out_pdgId_list = []
+            out_pt_list = []
+            out_eta_list = []
+            out_phi_list = []
+            out_mass_list = []
+
+            print(f"Processing {total_entries} entries in batches of {batch_size}...")
+
+            # Iterate in batches
+            for batch_start in range(0, total_entries, batch_size):
+                batch_stop = min(batch_start + batch_size, total_entries)
+                
+                # Read ONLY this batch
+                arrays = tree_in.arrays(
+                    ["PFCands_pdgId", "PFCands_pt", "PFCands_eta", "PFCands_phi", "PFCands_mass"],
+                    entry_start=batch_start,
+                    entry_stop=batch_stop
+                )
+
+                pdgId = arrays["PFCands_pdgId"]
+                pt = arrays["PFCands_pt"]
+                eta = arrays["PFCands_eta"]
+                phi = arrays["PFCands_phi"]
+                mass = arrays["PFCands_mass"]
+
+                # Apply logic
+                lepton_mask = (
+                    (pdgId == 11) | (pdgId == -11) | 
+                    (pdgId == 13) | (pdgId == -13)
+                )
+
+                nLeptons = ak.num(lepton_mask)
+                sel_pdgId = pdgId[lepton_mask]
+                sel_pt = pt[lepton_mask]
+                sel_eta = eta[lepton_mask]
+                sel_phi = phi[lepton_mask]
+                sel_mass = mass[lepton_mask]
+
+                # Filter events with at least one lepton
+                event_mask = nLeptons > 0
+                
+                # Append to lists
+                out_nLeptons_list.append(nLeptons[event_mask])
+                out_pdgId_list.append(sel_pdgId[event_mask])
+                out_pt_list.append(sel_pt[event_mask])
+                out_eta_list.append(sel_eta[event_mask])
+                out_phi_list.append(sel_phi[event_mask])
+                out_mass_list.append(sel_mass[event_mask])
+                
+                # Optional: Print progress
+                if batch_start % (batch_size) == 0:
+                    print(f"  Processed {batch_start}/{total_entries} entries")
+
+            # Concatenate all batches at the end
+            # This is the only time we hold the full result in memory, 
+            # but result is usually much smaller than input (skimmed).
+            if out_nLeptons_list:
+                final_data = {
+                    "nLeptons": ak.concatenate(out_nLeptons_list, axis=0),
+                    "Lepton_pdgId": ak.concatenate(out_pdgId_list, axis=0),
+                    "Lepton_pt": ak.concatenate(out_pt_list, axis=0),
+                    "Lepton_eta": ak.concatenate(out_eta_list, axis=0),
+                    "Lepton_phi": ak.concatenate(out_phi_list, axis=0),
+                    "Lepton_mass": ak.concatenate(out_mass_list, axis=0),
+                }
+                f_out["Events"] = final_data
+                print(f"Skimmed. Total Events: {len(final_data['nLeptons'])}")
+            else:
+                # Write empty structure if no events found
+                f_out["Events"] = {
+                    "nLeptons": ak.Array([]),
+                    "Lepton_pdgId": ak.Array([]),
+                    "Lepton_pt": ak.Array([]),
+                    "Lepton_eta": ak.Array([]),
+                    "Lepton_phi": ak.Array([]),
+                    "Lepton_mass": ak.Array([]),
+                }
+                print("Skimmed. Total Events: 0")
+        EOPY
+
+        echo "Starting Job $JOB_ID (Files: $FILE_COUNT)"
+        COUNTER=0
+
+        # a small python snippet inside the loop to call minio 
+        for FILE_KEY in $FILES; do
+          COUNTER=$((COUNTER+1))
+          BASENAME=$(basename $FILE_KEY)
+          LOCAL_INPUT="/tmp/input_${BASENAME}"
+          LOCAL_OUTPUT="$OUTPUT_DIR/skim_${BASENAME}"
+
+          echo "[$COUNTER/$FILE_COUNT] Processing: $BASENAME"
+          
+          # Download using MinIO 
+          python3 -c "import os; from minio import Minio; c=Minio('s3.pub1.infomaniak.cloud', access_key=os.environ['S3_ACCESS_KEY_ID'], secret_key=os.environ['S3_SECRET_ACCESS_KEY'], secure=True); c.fget_object('$BUCKET', '$FILE_KEY', '$LOCAL_INPUT')"
+          
+          export LOCAL_INPUT
+          export LOCAL_OUTPUT
+          python3 /tmp/skim_logic.py
+          
+          rm -f "$LOCAL_INPUT"
+        done
+        
+        echo "Job $JOB_ID Complete."
+
+
+  # --- Step 3: Merge skims ---
+  - name: merge-skims
+    inputs:
+      parameters:
+      - name: recid
+      - name: bucket
+      artifacts:
+      - name: skim-input
+        path: /tmp/skims
+        s3:
+          endpoint: s3.pub1.infomaniak.cloud
+          bucket: "{{inputs.parameters.bucket}}"
+          region: us-east-1
+          accessKeySecret: { name: s3-credentials, key: S3_ACCESS_KEY_ID }
+          secretKeySecret: { name: s3-credentials, key: S3_SECRET_ACCESS_KEY }
+          insecure: false
+          key: pfnano/{{inputs.parameters.recid}}/skims/
+    outputs:
+      artifacts:
+      - name: merged-skim
+        path: /tmp/final_skim.root
+        archive:
+          none: {}
+        s3:
+          endpoint: s3.pub1.infomaniak.cloud
+          bucket: "{{inputs.parameters.bucket}}"
+          region: us-east-1
+          accessKeySecret: { name: s3-credentials, key: S3_ACCESS_KEY_ID }
+          secretKeySecret: { name: s3-credentials, key: S3_SECRET_ACCESS_KEY }
+          insecure: false
+          key: pfnano/{{inputs.parameters.recid}}/merged_skim.root
+    script:
+      image: python:3.11-slim
+      command: [bash]
+      resources:
+        requests:
+          ephemeral-storage: "5Gi"
+          memory: "4Gi"
+      source: |
+        set -e
+
+        pip install --no-cache-dir uproot awkward
+
+        cd /tmp/skims
+        FILE_COUNT=$(ls -1 skim_*.root 2>/dev/null | wc -l)
+        if [ "$FILE_COUNT" -eq 0 ]; then
+          echo "No skim files found!"
+          exit 1
+        fi
+
+        echo "Merging $FILE_COUNT skim files..."
+        cat > merge_script.py << 'EOPY'
+        import uproot
+        import awkward as ak
+        import glob
+
+        input_files = sorted(glob.glob("skim_*.root"))
+        output_file = "/tmp/final_skim.root"
+        print(f"Merging {len(input_files)} files...")
+
+        all_data = {}
+        first = True
+        
+        for f_name in input_files:
+            with uproot.open(f_name) as f:
+                tree = f["Events"]
+                branches = tree.keys()
+                if first:
+                    for branch in branches:
+                        all_data[branch] = tree[branch].array()
+                    first = False
+                else:
+                    for branch in branches:
+                        arr = tree[branch].array()
+                        all_data[branch] = ak.concatenate([all_data[branch], arr], axis=0)
+        
+        print(f"Merged total events: {len(all_data[list(all_data.keys())[0]])}")
+
+        with uproot.recreate(output_file) as fout:
+            fout["Events"] = all_data
+        EOPY
+
+        python3 merge_script.py
+        echo "Merge complete. Size: $(ls -lh /tmp/final_skim.root | awk '{print $5}')"
+
+  # --- Step 4: Analysis ---
+  - name: cms-od-analyse
+    inputs:
+      parameters:
+      - name: recid
+      - name: bucket
+      artifacts:
+      - name: input-skim
+        path: /tmp/data/merged_skim.root
+        s3:
+          endpoint: s3.pub1.infomaniak.cloud
+          bucket: "{{inputs.parameters.bucket}}"
+          region: us-east-1
+          accessKeySecret: { name: s3-credentials, key: S3_ACCESS_KEY_ID }
+          secretKeySecret: { name: s3-credentials, key: S3_SECRET_ACCESS_KEY }
+          insecure: false
+          key: pfnano/{{inputs.parameters.recid}}/merged_skim.root
+    outputs:
+      artifacts:
+      - name: output
+        path: /tmp/plots
+        archive:
+          none: {}
+        s3:
+          endpoint: s3.pub1.infomaniak.cloud
+          bucket: "{{inputs.parameters.bucket}}"
+          region: us-east-1
+          accessKeySecret: { name: s3-credentials, key: S3_ACCESS_KEY_ID }
+          secretKeySecret: { name: s3-credentials, key: S3_SECRET_ACCESS_KEY }
+          insecure: false
+          key: pfnano/{{inputs.parameters.recid}}/plots/
+    script:
+      image: python:3.11-slim
+      command: [bash]
+      resources:
+        requests:
+          ephemeral-storage: "2Gi"
+          memory: "2Gi"
+      source: |
+        set -e
+        
+        pip install --no-cache-dir uproot awkward vector matplotlib
+
+        mkdir -p /tmp/plots
+        cd /tmp/plots
+
+        cat > analyse.py << 'EOPY'
+        import uproot
+        import awkward as ak
+        import vector
+        import matplotlib.pyplot as plt
+        import numpy as np
+
+        vector.register_awkward()
+        input_file = "/tmp/data/merged_skim.root"
+        print(f"Loading {input_file}...")
+        
+        with uproot.open(input_file) as f:
+            tree = f["Events"]
+            nLeptons = tree["nLeptons"].array()
+            pdgId = tree["Lepton_pdgId"].array()
+            pt = tree["Lepton_pt"].array()
+            eta = tree["Lepton_eta"].array()
+            phi = tree["Lepton_phi"].array()
+            mass = tree["Lepton_mass"].array()
+
+            print(f"Loaded {len(nLeptons)} events.")
+
+            nLeptons_np = ak.to_numpy(nLeptons)
+            print(f"nLeptons stats: min={nLeptons_np.min()}, max={nLeptons_np.max()}")
+            
+            plt.figure(figsize=(8, 5))
+            plt.hist(nLeptons_np, bins=120, histtype='step', linewidth=2)
+            plt.title("Number of Leptons per Event")
+            plt.xlabel("nLeptons")
+            plt.ylabel("Events")
+            plt.grid(True, alpha=0.3)
+            plt.savefig("h_num_cands.png")
+            plt.close()
+
+            plt.figure(figsize=(8, 5))
+            all_pdg = ak.flatten(pdgId)
+            plt.hist(ak.to_numpy(all_pdg), bins=range(-20, 20), histtype='step', linewidth=2)
+            plt.title("Type of Leptons (PDG ID)")
+            plt.xlabel("PDG ID")
+            plt.ylabel("Counts")
+            plt.grid(True, alpha=0.3)
+            plt.savefig("h_pdgid_cands.png")
+            plt.close()
+
+            particles = vector.zip({"pt": pt, "eta": eta, "phi": phi, "mass": mass})
+            mu_mask = ((pdgId == 13) | (pdgId == -13)) & (pt > 2.0)
+            el_mask = ((pdgId == 11) | (pdgId == -11)) & (pt > 2.0)
+            
+            mu_vec = particles[mu_mask]
+            mu_id = pdgId[mu_mask]
+            el_vec = particles[el_mask]
+            el_id = pdgId[el_mask]
+
+            mu_pairs = ak.combinations(mu_vec, 2)
+            mu_id_pairs = ak.combinations(mu_id, 2)
+            p1_mu, p2_mu = mu_pairs["0"], mu_pairs["1"]
+            id1_mu, id2_mu = mu_id_pairs["0"], mu_id_pairs["1"]
+            os_mu = (id1_mu * id2_mu) < 0
+            dimuon_mass = (p1_mu + p2_mu)[os_mu].mass
+
+            el_pairs = ak.combinations(el_vec, 2)
+            el_id_pairs = ak.combinations(el_id, 2)
+            p1_el, p2_el = el_pairs["0"], el_pairs["1"]
+            id1_el, id2_el = el_id_pairs["0"], el_id_pairs["1"]
+            os_el = (id1_el * id2_el) < 0
+            dielectron_mass = (p1_el + p2_el)[os_el].mass
+
+            plt.figure(figsize=(8, 6))
+            dimuon_flat = ak.flatten(dimuon_mass)
+            if len(dimuon_flat) > 0:
+                plt.hist(ak.to_numpy(dimuon_flat), bins=120, range=(0, 120), histtype='step', color='blue', linewidth=2)
+            plt.title("Dimuon Invariant Mass")
+            plt.xlabel("M_{mumu} (GeV)")
+            plt.ylabel("Events")
+            plt.grid(True, alpha=0.3)
+            plt.savefig("h_dimuon_mass.png")
+            plt.close()
+
+            plt.figure(figsize=(8, 6))
+            dielectron_flat = ak.flatten(dielectron_mass)
+            if len(dielectron_flat) > 0:
+                plt.hist(ak.to_numpy(dielectron_flat), bins=120, range=(0, 120), histtype='step', color='red', linewidth=2)
+            plt.title("Dielectron Invariant Mass")
+            plt.xlabel("M_{ee} (GeV)")
+            plt.ylabel("Events")
+            plt.grid(True, alpha=0.3)
+            plt.savefig("h_dielectron_mass.png")
+            plt.close()
+            print("Analysis complete.")
+        EOPY
+
+        python3 analyse.py
+        ls -l /tmp/plots
